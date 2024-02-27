@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"net/http"
+	"strconv"
 
 	"github.com/gorilla/websocket"
 )
@@ -15,6 +17,34 @@ type Server struct {
 	idSubscribers    SubStorage
 	schemas          Schemas
 	instances        Instances
+}
+
+func respond(sub *Sub, req *ReqJson, msg json.RawMessage) {
+	res := &ResJson{
+		Type: req.Type,
+		Id:   req.Id,
+		Msg:  msg,
+	}
+	sub.ws.WriteJSON(res)
+}
+func respondError(sub *Sub, req *ReqJson, errorString string) {
+	res := &ResJson{
+		Type:  req.Type,
+		Id:    req.Id,
+		Msg:   nil,
+		Error: errorString,
+	}
+	sub.ws.WriteJSON(res)
+}
+
+func calcUniqueInstanceId(schemaId SchemaId, count int) InstanceId {
+	str := string(schemaId) + ":" + strconv.Itoa(count)
+
+	h := fnv.New32a()
+	h.Write([]byte(str))
+	hash := int(h.Sum32())
+
+	return InstanceId(strconv.Itoa(hash))
 }
 
 func (s *Server) handle_sub_msg(sub *Sub, raw []byte, msgType int) {
@@ -62,9 +92,9 @@ func (s *Server) handle_sub_msg(sub *Sub, raw []byte, msgType int) {
 		s.setSubscribe(msg.Id, isTopic, sub, false)
 	} else if req.Type == "list" {
 		rmsg := &ResList{
-			Topics: []string{},
+			Topics: []SchemaId{},
 		}
-		for k, _ := range s.schemas {
+		for k := range s.schemas {
 			rmsg.Topics = append(rmsg.Topics, k)
 		}
 
@@ -90,7 +120,7 @@ func (s *Server) handle_sub_msg(sub *Sub, raw []byte, msgType int) {
 			return
 		}
 
-		s.schemas[msg.Id] = msg.Change
+		s.schemas[msg.SchemaId] = msg.Schema
 	} else if req.Type == "schema-get" {
 		msg := &ReqSchemaGet{}
 
@@ -125,20 +155,56 @@ func (s *Server) handle_sub_msg(sub *Sub, raw []byte, msgType int) {
 			fmt.Println(err)
 			return
 		}
-		inst, ok := s.instances[msg.Id]
-		if ok {
-			for k, _ := range inst {
-				inst[k] = msg.Change[k]
-			}
-			s.instances[msg.Id] = inst
-		} else {
-			inst = msg.Change
-			s.instances[msg.Id] = inst
+		//what instance are we talking about?
+		instance, isValidInstanceId := s.instances[msg.Id]
+
+		//make sure an instance already exists with the id for mutation
+		if !isValidInstanceId {
+			//if instance doesn't exist, don't try to apply changes
+			return
 		}
 
+		//get the schema for this instance
+		// instanceSchema := s.schemas[msg.Change.SchemaId]
+		instanceSchema := s.schemas[instance.SchemaId]
+
+		//get the change
+		Change := msg.Change
+
+		AppliedChanges := map[FieldId]any{}
+
+		//loop over each key in Change Data
+		for ChangeFieldId, ChangeFieldValue := range Change {
+
+			//get the field type
+			SchemaFieldType, isValidField := instanceSchema.Fields[ChangeFieldId]
+
+			// fmt.Println(instance, ChangeFieldId, ChangeFieldValue)
+
+			//schema must have field, and it's type must match the change data
+			if isValidField {
+				if valueIsFieldType(ChangeFieldValue, SchemaFieldType, false) {
+					//apply the change of this field to the instance
+					AppliedChanges[ChangeFieldId] = ChangeFieldValue
+
+					instance.Data[ChangeFieldId] = ChangeFieldValue
+
+					// fmt.Println("Applied", instance, ChangeFieldId, ChangeFieldValue)
+				} else {
+					fmt.Println("invalid field value", ChangeFieldValue, SchemaFieldType)
+				}
+			} else {
+				fmt.Println("invalid field", ChangeFieldId)
+			}
+		}
+		//re-apply the instance to the store (we're not using pointers)
+		s.instances[msg.Id] = instance
+
+		//push changes to subscribers
+
 		resmsg := &ResPub{
-			Id:       msg.Id,
-			Instance: inst,
+			Id:     msg.Id,
+			Change: AppliedChanges,
 		}
 		ResMsg, err := json.Marshal(resmsg)
 		if err != nil {
@@ -161,6 +227,44 @@ func (s *Server) handle_sub_msg(sub *Sub, raw []byte, msgType int) {
 		s.walkSubs(msg.Id, false, func(sub *Sub) {
 			sub.ws.WriteMessage(websocket.TextMessage, Res)
 		})
+	} else if req.Type == "inst" {
+		msg := &ReqInst{}
+		err = json.Unmarshal(req.Msg, &msg)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		schema, isValidSchema := s.schemas[msg.SchemaId]
+		if !isValidSchema {
+			respondError(sub, req, "unknown schema, cannot instance")
+			return
+		}
+		Data := InstanceData{}
+
+		for FieldId, FieldType := range schema.Fields {
+			Data[FieldId] = FieldDefaultForType(FieldType)
+		}
+
+		Instance := Instance{
+			SchemaId: msg.SchemaId,
+			Data:     Data,
+		}
+
+		count := len(s.instances)
+		InstanceId := calcUniqueInstanceId(msg.SchemaId, count)
+
+		resinst := &ResInst{
+			Instance:   Instance,
+			InstanceId: InstanceId,
+		}
+
+		Msg, err := json.Marshal(resinst)
+		if err != nil {
+			respondError(sub, req, "server error: couldn't marshal instance json")
+			return
+		}
+		respond(sub, req, Msg)
+		s.instances[InstanceId] = Instance
 
 	} else {
 		fmt.Println("Unhandled json Type:", req.Type)
@@ -207,27 +311,27 @@ func makeServer() *Server {
 	return result
 }
 
-func (s *Server) subsGetOrCreate(topicOrId string, isTopic bool) Subs {
+func (s *Server) subsGetOrCreate(topicOrId InstanceId, isTopic bool) Subs {
 	var result Subs = nil
 	if isTopic {
-		result = s.topicSubscribers[topicOrId]
+		result = s.topicSubscribers[string(topicOrId)]
 	} else {
-		result = s.idSubscribers[topicOrId]
+		result = s.idSubscribers[string(topicOrId)]
 	}
 
 	if result == nil {
 		result = make(Subs)
 		if isTopic {
-			s.topicSubscribers[topicOrId] = result
+			s.topicSubscribers[string(topicOrId)] = result
 		} else {
-			s.idSubscribers[topicOrId] = result
+			s.idSubscribers[string(topicOrId)] = result
 		}
 	}
 
 	return result
 }
 
-func (s *Server) setSubscribe(topicOrId string, isTopic bool, sub *Sub, isSub bool) {
+func (s *Server) setSubscribe(topicOrId InstanceId, isTopic bool, sub *Sub, isSub bool) {
 	subs := s.subsGetOrCreate(topicOrId, isTopic)
 	if isSub {
 		subs[sub] = true
@@ -239,14 +343,14 @@ func (s *Server) setSubscribe(topicOrId string, isTopic bool, sub *Sub, isSub bo
 
 type walkSubsCb = func(sub *Sub)
 
-func (s *Server) walkSubs(topicOrId string, isTopic bool, cb walkSubsCb) {
+func (s *Server) walkSubs(topicOrId InstanceId, isTopic bool, cb walkSubsCb) {
 	var subs Subs = nil
 	if isTopic {
 		subs = s.subsGetOrCreate(topicOrId, isTopic)
 	} else {
 		subs = s.subsGetOrCreate(topicOrId, isTopic)
 	}
-	for k, _ := range subs {
+	for k := range subs {
 		cb(k)
 	}
 }
